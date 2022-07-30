@@ -7,6 +7,7 @@ package cmd
 import (
 	"context"
 	"ecapture/user"
+	"errors"
 	"log"
 	"os"
 	"os/signal"
@@ -40,6 +41,8 @@ func init() {
 	opensslCmd.PersistentFlags().StringVar(&nc.Nsprpath, "nspr", "", "libnspr44.so file path, will automatically find it from curl default.")
 	opensslCmd.PersistentFlags().StringVar(&oc.Pthread, "pthread", "", "libpthread.so file path, use to hook connect to capture socket FD.will automatically find it from curl.")
 	opensslCmd.PersistentFlags().StringVar(&goc.Path, "gobin", "", "path to binary built with Go toolchain.")
+	opensslCmd.PersistentFlags().StringVarP(&oc.Write, "write", "w", "", "write the  raw packets to file as pcapng format.")
+	opensslCmd.PersistentFlags().StringVarP(&oc.Ifname, "ifname", "i", "", "(TC Classifier) Interface name on which the probe will be attached.")
 
 	rootCmd.AddCommand(opensslCmd)
 }
@@ -53,9 +56,9 @@ func openSSLCommandFunc(command *cobra.Command, args []string) {
 	logger := log.New(os.Stdout, "tls_", log.LstdFlags)
 
 	// save global config
-	gConf, e := getGlobalConf(command)
-	if e != nil {
-		logger.Fatal(e)
+	gConf, err := getGlobalConf(command)
+	if err != nil {
+		logger.Fatal(err)
 	}
 	if gConf.loggerFile != "" {
 		f, e := os.Create(gConf.loggerFile)
@@ -101,14 +104,23 @@ func openSSLCommandFunc(command *cobra.Command, args []string) {
 		conf.SetHex(gConf.IsHex)
 		conf.SetNoSearch(gConf.NoSearch)
 
-		logger.Printf("%s\tmodule initialization", mod.Name())
-		if e := conf.Check(); e != nil {
-			logger.Printf("%s\tmodule initialization failed. [skip it]. error:%+v", mod.Name(), e)
+		err := conf.Check()
+
+		if err != nil {
+			// ErrorGoBINNotSET is a special error, we should not print it.
+			if errors.Is(err, user.ErrorGoBINNotSET) {
+				logger.Printf("%s\tmodule [disabled].", mod.Name())
+				continue
+			}
+
+			logger.Printf("%s\tmodule initialization failed. [skip it]. error:%+v", mod.Name(), err)
 			continue
 		}
 
+		logger.Printf("%s\tmodule initialization", mod.Name())
+
 		//初始化
-		err := mod.Init(ctx, logger, conf)
+		err = mod.Init(ctx, logger, conf)
 		if err != nil {
 			logger.Printf("%s\tmodule initialization failed, [skip it]. error:%+v", mod.Name(), err)
 			continue

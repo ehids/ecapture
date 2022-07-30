@@ -16,6 +16,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -40,6 +41,13 @@ type Tls13MasterSecret struct {
 	ClientTrafficSecret0         []byte
 }
 
+type EBPFPROGRAMTYPE uint8
+
+const (
+	EBPFPROGRAMTYPE_OPENSSL_TC EBPFPROGRAMTYPE = iota
+	EBPFPROGRAMTYPE_OPENSSL_UPROBE
+)
+
 type MOpenSSLProbe struct {
 	Module
 	bpfManager        *manager.Manager
@@ -50,9 +58,11 @@ type MOpenSSLProbe struct {
 	// pid[fd:Addr]
 	pidConns map[uint32]map[uint32]string
 
-	filename   string
-	file       *os.File
-	masterKeys map[string]bool
+	keyloggerFilename string
+	keylogger         *os.File
+	masterKeys        map[string]bool
+	eBPFProgramType   EBPFPROGRAMTYPE
+	pcapngFilename    string
 }
 
 //对象初始化
@@ -65,21 +75,30 @@ func (this *MOpenSSLProbe) Init(ctx context.Context, logger *log.Logger, conf IC
 	this.pidConns = make(map[uint32]map[uint32]string)
 	this.masterKeys = make(map[string]bool)
 	fd := os.Getpid()
-	this.filename = fmt.Sprintf("ecapture_masterkey_%d.log", fd)
-	file, err := os.OpenFile(this.filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	this.keyloggerFilename = fmt.Sprintf("ecapture_masterkey_%d.log", fd)
+	file, err := os.OpenFile(this.keyloggerFilename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 	if err != nil {
 		return err
 	}
-	this.file = file
-	this.logger.Printf("master key file: %s\n", this.filename)
+	this.keylogger = file
+	var writeFile = this.conf.(*OpensslConfig).Write
+	if len(writeFile) > 0 {
+		this.eBPFProgramType = EBPFPROGRAMTYPE_OPENSSL_TC
+		fileInfo, err := filepath.Abs(writeFile)
+		if err != nil {
+			return err
+		}
+		this.pcapngFilename = fileInfo
+	} else {
+		this.eBPFProgramType = EBPFPROGRAMTYPE_OPENSSL_UPROBE
+		this.logger.Printf("%s\tmaster key keylogger: %s\n", this.Name(), this.keyloggerFilename)
+	}
+
 	return nil
 }
 
 func (this *MOpenSSLProbe) Start() error {
-	if err := this.start(); err != nil {
-		return err
-	}
-	return nil
+	return this.start()
 }
 
 func (this *MOpenSSLProbe) start() error {
@@ -87,11 +106,22 @@ func (this *MOpenSSLProbe) start() error {
 	// fetch ebpf assets
 	byteBuf, err := assets.Asset("user/bytecode/openssl_kern.o")
 	if err != nil {
-		return fmt.Errorf("couldn't find asset %v .", err)
+		return fmt.Errorf("%s\tcouldn't find asset %v .", this.Name(), err)
 	}
 
 	// setup the managers
-	err = this.setupManagers()
+	switch this.eBPFProgramType {
+	case EBPFPROGRAMTYPE_OPENSSL_TC:
+		this.logger.Printf("%s\tTC MODEL\n", this.Name())
+		err = this.setupManagersTC()
+	case EBPFPROGRAMTYPE_OPENSSL_UPROBE:
+		this.logger.Printf("%s\tUPROBE MODEL\n", this.Name())
+		err = this.setupManagersUprobe()
+	default:
+		this.logger.Printf("%s\tUPROBE MODEL\n", this.Name())
+		err = this.setupManagersUprobe()
+	}
+
 	if err != nil {
 		return fmt.Errorf("tls module couldn't find binPath %v .", err)
 	}
@@ -107,7 +137,14 @@ func (this *MOpenSSLProbe) start() error {
 	}
 
 	// 加载map信息，map对应events decode表。
-	err = this.initDecodeFun()
+	switch this.eBPFProgramType {
+	case EBPFPROGRAMTYPE_OPENSSL_TC:
+		err = this.initDecodeFunTC()
+	case EBPFPROGRAMTYPE_OPENSSL_UPROBE:
+		err = this.initDecodeFun()
+	default:
+		err = this.initDecodeFun()
+	}
 	if err != nil {
 		return err
 	}
@@ -151,7 +188,7 @@ func (this *MOpenSSLProbe) constantEditor() []manager.ConstantEditor {
 	return editor
 }
 
-func (this *MOpenSSLProbe) setupManagers() error {
+func (this *MOpenSSLProbe) setupManagersUprobe() error {
 	var binaryPath, libPthread string
 	switch this.conf.(*OpensslConfig).elfType {
 	case ELF_TYPE_BIN:
@@ -440,7 +477,7 @@ func (this *MOpenSSLProbe) saveMasterSecret(event *MasterSecretEvent) {
 		b = bytes.NewBufferString(fmt.Sprintf("%s %02x %02x\n", CLIENT_RANDOM, event.ClientRandom, event.MasterKey))
 	}
 	v := tls_version{version: event.Version}
-	l, e := this.file.WriteString(b.String())
+	l, e := this.keylogger.WriteString(b.String())
 	if e != nil {
 		this.logger.Fatalf("%s: save CLIENT_RANDOM to file error:%s", v.String(), e.Error())
 		return
@@ -455,6 +492,8 @@ func (this *MOpenSSLProbe) Dispatcher(event event_processor.IEventStruct) {
 		this.AddConn(event.(*ConnDataEvent).Pid, event.(*ConnDataEvent).Fd, event.(*ConnDataEvent).Addr)
 	case *MasterSecretEvent:
 		this.saveMasterSecret(event.(*MasterSecretEvent))
+	case *TcSkbEvent:
+		this.dumpTcSkb(event.(*TcSkbEvent))
 	}
 	//this.logger.Println(event)
 }
